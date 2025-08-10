@@ -2,47 +2,47 @@
 
 ## Abstract
 
-FlashAttention (FA‑1/2) made exact attention IO‑aware and fast; FlashAttention‑3 (FA‑3) reached near‑roofline on H100 by exploiting TMA, warp specialization, and FP8 paths. ([arXiv][1], [tridao.me][2]) Yet production serving still wastes cycles at **prefill↔decode boundaries** and burns bandwidth on **KV cache traffic**.
+FlashAttention (FA‑1/2) made exact attention IO‑aware and fast; FlashAttention‑3 (FA‑3) reached near‑roofline on H100 by exploiting TMA, warp specialization, and FP8 paths. ([arXiv][1], [tridao.me][2]) Yet production serving still wastes cycles at prefill↔decode boundaries and burns bandwidth on KV cache traffic.
 
-We introduce **FlashAttention‑4 (FA‑4)**, a kernel stack that:
+We introduce FlashAttention‑4 (FA‑4), a kernel stack that:
 
-1. **Co‑schedules prefill and decode** within a **persistent, cluster‑aware kernel** so Tensor Cores and TMA stay busy across phase boundaries (phase‑cooperative execution). This generalizes intra‑kernel overlap in FA‑3 to **inter‑phase** overlap and differs from hybrid‑batch kernels like POD‑Attention by adding **cluster‑local KV reuse and multicast prefetch**. ([arXiv][3], [ACM Digital Library][4])
-2. Adds **cluster‑locality**: shard KV tiles across **thread‑block clusters** and use **TMA multicast** to feed all consumers that will imminently reuse a tile—cutting redundant HBM reads. ([NVIDIA Docs][5], [PyTorch][6])
-3. Introduces **PAQ**—a **Precision‑Adaptive Quantization** policy that selects FP16/BF16, FP8, or **FP4 (NVFP4)** *per tile and per stage* using a provable softmax‑sensitivity test. PAQ is compatible with NVIDIA’s **microscaled FP4 (NVFP4)** block scaling (16‑value groups + FP8 scale) and the **second‑generation Transformer Engine** in Blackwell. ([NVIDIA Docs][7], [NVIDIA Developer][8], [NVIDIA][9])
+1. Co‑schedules prefill and decode within a persistent, cluster‑aware kernel so Tensor Cores and TMA stay busy across phase boundaries (phase‑cooperative execution). This generalizes intra‑kernel overlap in FA‑3 to inter‑phase overlap and differs from hybrid‑batch kernels like POD‑Attention by adding cluster‑local KV reuse and multicast prefetch. ([arXiv][3], [ACM Digital Library][4])
+2. Adds cluster‑locality: shard KV tiles across thread‑block clusters and use TMA multicast to feed all consumers that will imminently reuse a tile—cutting redundant HBM reads. ([NVIDIA Docs][5], [PyTorch][6])
+3. Introduces PAQ—a Precision‑Adaptive Quantization policy that selects FP16/BF16, FP8, or FP4 (NVFP4) *per tile and per stage* using a provable softmax‑sensitivity test. PAQ is compatible with NVIDIA’s microscaled FP4 (NVFP4) block scaling (16‑value groups + FP8 scale) and the second‑generation Transformer Engine in Blackwell. ([NVIDIA Docs][7], [NVIDIA Developer][8], [NVIDIA][9])
 
-We provide an **asynchronous overlap model** that yields closed‑form tiling rules and **buffer counts** under Tensor‑Core FLOP rate, TMA bandwidth, and cluster‑SMEM constraints, and we lay out an evaluation plan on H100/B200 across prefill‑heavy, decode‑heavy, and mixed traces with long‑context and MoE stressors.
+We provide an asynchronous overlap model that yields closed‑form tiling rules and **buffer counts** under Tensor‑Core FLOP rate, TMA bandwidth, and cluster‑SMEM constraints, and we lay out an evaluation plan on H100/B200 across prefill‑heavy, decode‑heavy, and mixed traces with long‑context and MoE stressors.
 
 ---
 
 ## 1 Introduction
 
-Exact attention is now IO‑optimal in theory and fast in practice, but **serving traces are multi‑phase**: bulk matrix‑heavy prefill then memory‑bound, token‑by‑token decode. FA‑3 squeezed within‑phase overlap using TMA + warp specialization and showed accurate FP8 paths; however, **SMs still idle at prefill↔decode boundaries**, and **KV traffic dominates** beyond \~8–16K context. ([arXiv][1], [tridao.me][2]) Parallel work (POD‑Attention) overlaps prefill and decode inside a single attention kernel for hybrid batches, but does not exploit **cluster‑level KV reuse** or **FP4‑aware precision selection**. ([arXiv][10], [ACM Digital Library][4])
+Exact attention is now IO‑optimal in theory and fast in practice, but serving traces are multi‑phase: bulk matrix‑heavy prefill then memory‑bound, token‑by‑token decode. FA‑3 squeezed within‑phase overlap using TMA + warp specialization and showed accurate FP8 paths; however, SMs still idle at prefill↔decode boundaries, and KV traffic dominates beyond \~8–16K context. ([arXiv][1], [tridao.me][2]) Parallel work (POD‑Attention) overlaps prefill and decode inside a single attention kernel for hybrid batches, but does not exploit cluster‑level KV reuse or FP4‑aware precision selection. ([arXiv][10], [ACM Digital Library][4])
 
-**FA‑4** targets these two bottlenecks with **phase‑cooperative execution**, **cluster‑local multicast**, and a **precision policy** grounded in softmax sensitivity and **NVFP4** block scaling. We leverage Hopper’s **TMA** and thread‑block **clusters** and Blackwell’s **2nd‑gen Transformer Engine** with FP4 support. ([NVIDIA Developer][11], [NVIDIA Docs][5], [NVIDIA][9])
+FA‑4 targets these two bottlenecks with phase‑cooperative execution, cluster‑local multicast, and a precision policy grounded in softmax sensitivity and NVFP4 block scaling. We leverage Hopper’s TMA and thread‑block clusters and Blackwell’s 2nd‑gen Transformer Engine with FP4 support. ([NVIDIA Developer][11], [NVIDIA Docs][5], [NVIDIA][9])
 
 ### Contributions
 
-* **Phase‑Cooperative Coordinator.** A persistent, cluster‑aware scheduler co‑executes prefill and decode within one kernel, allocating CTAs to **two lanes** (prefill, decode) to saturate Tensor Cores and TMA concurrently. Unlike prior hybrid‑batch kernels, our coordinator is **cluster‑aware** and co‑optimizes **multicast KV prefetch** with lane assignment. ([ACM Digital Library][4])
-* **Cluster‑Local KV with TMA Multicast.** We keep **hot K/V tiles** in **cluster shared memory** and use **TMA multicast** to prefetch those tiles once for all consumers in the cluster, reducing HBM reads and improving decode locality. ([NVIDIA Docs][5], [PyTorch][6])
-* **PAQ: Precision‑Adaptive Quantization.** A per‑tile policy chooses FP4/FP8/FP16 using a **margin‑based softmax sensitivity test**; numerically delicate reductions (e.g., log‑sum‑exp) stay in FP16/BF16. The policy matches **NVFP4** quantization granularity (16‑value groups with FP8 scale), aligning with public cuDNN/TE recipes and Blackwell hardware. ([NVIDIA Docs][7], [NVIDIA Developer][8])
-* **Async Overlap Theory.** We extend IO‑aware models to **asynchronous, dual‑lane pipelines**, giving tiling rules and **buffer counts** that balance Tensor‑Core FLOPs against TMA bandwidth and cluster SMEM limits.
+* Phase‑Cooperative Coordinator. A persistent, cluster‑aware scheduler co‑executes prefill and decode within one kernel, allocating CTAs to two lanes (prefill, decode) to saturate Tensor Cores and TMA concurrently. Unlike prior hybrid‑batch kernels, our coordinator is **cluster‑aware** and co‑optimizes multicast KV prefetch with lane assignment. ([ACM Digital Library][4])
+* Cluster‑Local KV with TMA Multicast. We keep hot K/V tiles in cluster shared memory and use **TMA multicast** to prefetch those tiles once for all consumers in the cluster, reducing HBM reads and improving decode locality. ([NVIDIA Docs][5], [PyTorch][6])
+* PAQ: Precision‑Adaptive Quantization. A per‑tile policy chooses FP4/FP8/FP16 using a margin‑based softmax sensitivity test; numerically delicate reductions (e.g., log‑sum‑exp) stay in FP16/BF16. The policy matches NVFP4 quantization granularity (16‑value groups with FP8 scale), aligning with public cuDNN/TE recipes and Blackwell hardware. ([NVIDIA Docs][7], [NVIDIA Developer][8])
+* Async Overlap Theory. We extend IO‑aware models to asynchronous, dual‑lane pipelines, giving tiling rules and **buffer counts** that balance Tensor‑Core FLOPs against TMA bandwidth and cluster SMEM limits.
 
 ---
 
 ## 2 Related Work
 
-**FlashAttention 1/2/3.** FA‑1 introduces IO‑optimal tiling; FA‑2 improves parallelism/work partitioning; FA‑3 adds warp specialization, TMA interleave, and FP8. We build on FA‑3’s asynchrony but **optimize across phases** and add **cluster‑aware** locality + **FP4**. ([arXiv][1], [tridao.me][2])
-**Hybrid prefill/decode kernels.** POD‑Attention co‑executes prefill and decode for hybrid batches; our design integrates **multicast KV**, **cluster buffering**, and **precision policy** that POD does not address. ([arXiv][10])
-**KV management.** PagedAttention (vLLM) manages KV in blocks to avoid fragmentation—our cluster‑locality complements paged storage by reducing **tile rereads** and decode stalls. ([arXiv][12])
-**Low precision.** NVIDIA Blackwell introduces FP4 support and a 2nd‑gen Transformer Engine; NVFP4 block scaling is now documented in cuDNN Frontend. We design PAQ explicitly around these primitives. ([NVIDIA][9], [NVIDIA Docs][7])
+FlashAttention 1/2/3. FA‑1 introduces IO‑optimal tiling; FA‑2 improves parallelism/work partitioning; FA‑3 adds warp specialization, TMA interleave, and FP8. We build on FA‑3’s asynchrony but optimize across phases and add cluster‑aware locality + **FP4**. ([arXiv][1], [tridao.me][2])
+Hybrid prefill/decode kernels. POD‑Attention co‑executes prefill and decode for hybrid batches; our design integrates multicast KV, cluster buffering, and precision policy that POD does not address. ([arXiv][10])
+KV management. PagedAttention (vLLM) manages KV in blocks to avoid fragmentation—our cluster‑locality complements paged storage by reducing tile rereads and decode stalls. ([arXiv][12])
+Low precision. NVIDIA Blackwell introduces FP4 support and a 2nd‑gen Transformer Engine; NVFP4 block scaling is now documented in cuDNN Frontend. We design PAQ explicitly around these primitives. ([NVIDIA][9], [NVIDIA Docs][7])
 
 ---
 
 ## 3 Background: Hardware primitives we exploit
 
-* **TMA, async barriers, warp specialization (Hopper).** TMA enables multi‑dimensional async copies between HBM and SMEM; async barriers + warp specialization allow deep pipelining. ([NVIDIA Developer][11], [Colfax Research][13])
-* **Thread‑block clusters & distributed SMEM.** Clusters permit CTAs to access each other’s SMEM, enabling **cluster‑resident** KV tiles and collective prefetch. ([NVIDIA Docs][5])
-* **Blackwell FP4 & 2nd‑gen TE.** Blackwell adds **FP4** and micro‑scaled formats to its Transformer Engine; NVFP4 uses **16‑element groups** with an **FP8 E4M3 scale**. ([NVIDIA][9], [NVIDIA Docs][7])
+* TMA, async barriers, warp specialization (Hopper). TMA enables multi‑dimensional async copies between HBM and SMEM; async barriers + warp specialization allow deep pipelining. ([NVIDIA Developer][11], [Colfax Research][13])
+* Thread‑block clusters & distributed SMEM. Clusters permit CTAs to access each other’s SMEM, enabling cluster‑resident KV tiles and collective prefetch. ([NVIDIA Docs][5])
+* Blackwell FP4 & 2nd‑gen TE. Blackwell adds **FP4** and micro‑scaled formats to its Transformer Engine; NVFP4 uses 16‑element groups with an FP8 E4M3 scale. ([NVIDIA][9], [NVIDIA Docs][7])
 
 ---
 
@@ -50,44 +50,44 @@ Exact attention is now IO‑optimal in theory and fast in practice, but **servin
 
 ### 4.1 Phase‑Cooperative Coordinator (PCC)
 
-We launch a single **persistent, cluster‑aware kernel** that exposes two logical **lanes**:
+We launch a single persistent, cluster‑aware kernel that exposes two logical lanes:
 
-* **Lane‑A (Prefill)**: large M×K GEMMs for `QKᵀ` & `Attn·V` with online max/LSE.
-* **Lane‑B (Decode)**: tiny‑N tiles (1–16 tokens) with high **KV reuse** potential.
+* Lane‑A (Prefill): large M×K GEMMs for `QKᵀ` & `Attn·V` with online max/LSE.
+* Lane‑B (Decode): tiny‑N tiles (1–16 tokens) with high KV reuse potential.
 
-A **coordinator** (one warp per cluster) maintains a target tuple
+A coordinator (one warp per cluster) maintains a target tuple
 
 $$
 (\text{TC\_util}, \text{TMA\_util}, \text{SMEM\_watermark})
 $$
 
-and assigns incoming work units (prefill blocks, decode micro‑batches) to CTAs such that **Tensor‑Core cycles** and **TMA copies** stay overlapped. In practice:
+and assigns incoming work units (prefill blocks, decode micro‑batches) to CTAs such that Tensor‑Core cycles and TMA copies stay overlapped. In practice:
 
-* Keep at least **ρ CTAs** per cluster pinned to **decode** to protect tail latency.
-* Fill the rest with **prefill** CTAs to back‑pressure TMA bandwidth.
-* When **KV‑tile popularity** spikes (hot decode set), temporarily **bias** CTAs toward decode to maximize reuse before eviction.
+* Keep at least ρ CTAs per cluster pinned to decode to protect tail latency.
+* Fill the rest with prefill CTAs to back‑pressure TMA bandwidth.
+* When KV‑tile popularity spikes (hot decode set), temporarily bias CTAs toward decode to maximize reuse before eviction.
 
-Compared to FA‑3’s intra‑phase overlap, PCC removes **phase bubbles** and aligns **KV reuse windows** with **decode demand**. ([tridao.me][2])
+Compared to FA‑3’s intra‑phase overlap, PCC removes phase bubbles and aligns KV reuse windows with decode demand. ([tridao.me][2])
 
 ### 4.2 Cluster‑Local KV with Multicast Prefetch
 
-* **Sharding.** Partition K/V by sequence‑block into **cluster‑resident rings** sized to SMEM.
-* **Multicast.** Use **TMA multicast** to copy each K or V tile **once** from HBM into all CTAs that will consume it soon (decode lane), then keep it **resident** until a simple **importance score** falls below threshold. Importance uses a running upper bound of attention mass observed in the lane‑A online‑softmax stage. ([PyTorch][6])
-* **Eviction.** Greedy LFU‑style over tiles, constrained by SMEM pressure of the current `(M,N,K)` tiling.
+* Sharding. Partition K/V by sequence‑block into cluster‑resident rings sized to SMEM.
+* Multicast. Use **TMA multicast** to copy each K or V tile once from HBM into all CTAs that will consume it soon (decode lane), then keep it resident until a simple importance score falls below threshold. Importance uses a running upper bound of attention mass observed in the lane‑A online‑softmax stage. ([PyTorch][6])
+* Eviction. Greedy LFU‑style over tiles, constrained by SMEM pressure of the current `(M,N,K)` tiling.
 
-This design reduces HBM rereads versus per‑CTA prefetch and exploits **distributed SMEM** permitted by clusters. ([NVIDIA Docs][5])
+This design reduces HBM rereads versus per‑CTA prefetch and exploits distributed SMEM permitted by clusters. ([NVIDIA Docs][5])
 
 ### 4.3 PAQ: Precision‑Adaptive Quantization
 
-**Key correction vs. the baseline draft:** softmax is **most sensitive when logits are flat** (small margin), not when dynamic range is large. Therefore, **use *lower* precision (FP4) only when the logit margin is large**, and fall back to FP8/FP16 when the distribution is flat.
+Key correction vs. the baseline draft: softmax is most sensitive when logits are flat (small margin), not when dynamic range is large. Therefore, use *lower* precision (FP4) only when the logit margin is large, and fall back to FP8/FP16 when the distribution is flat.
 
-We formalize a **margin test** per (sub)tile `Z` (logits before softmax):
+We formalize a margin test per (sub)tile `Z` (logits before softmax):
 
 * Let `m1 = max_i Z_i`, `m2` be second max, and temperature `τ`.
 * The Jacobian of `softmax(Z/τ)` has operator norm ≤ `1/(2τ)` and is largest near uniform distributions; hence the output perturbation ‖Δp‖ is bounded by `‖ΔZ‖ / (2τ)` (conservative).
-* We run **NVFP4** block quantization (16‑elem groups + FP8 scale) on the **matmul operands** and the **softmax inputs** **only if** `(m1−m2)/τ ≥ γ` *and* an online estimate of `‖ΔZ‖` from block‑scale quantization is ≤ `ε`. Otherwise we use **FP8**; log‑sum‑exp accumulators are **always FP16/BF16**.
+* We run NVFP4 block quantization (16‑elem groups + FP8 scale) on the matmul operands and the softmax inputs only if `(m1−m2)/τ ≥ γ` *and* an online estimate of `‖ΔZ‖` from block‑scale quantization is ≤ `ε`. Otherwise we use FP8; log‑sum‑exp accumulators are always FP16/BF16.
 
-This aligns with **cuDNN’s NVFP4 recipe** and **Blackwell’s TE** capabilities. ([NVIDIA Docs][7], [NVIDIA][9])
+This aligns with cuDNN's NVFP4 recipe and **Blackwell’s TE** capabilities. ([NVIDIA Docs][7], [NVIDIA][9])
 
 #### Where we apply FP4 safely
 
